@@ -155,10 +155,10 @@ fn main() -> io::Result<()> {
     let mut merge_count = 0;
     for (_, change) in &graph {
         if change.children.len() > 1 {
-            branch_count += change.children.len() - 1;
+            branch_count += change.children.len();
         }
         if change.parents.len() > 1 {
-            merge_count += change.parents.len() - 1;
+            merge_count += 1;
         }
     }
 
@@ -229,9 +229,9 @@ fn main() -> io::Result<()> {
                     }
                     last_conflict_id = current_id.clone();
                 }
-                if !current_node.bookmarks.is_empty() && next_branch_id.is_empty() {
-                    next_branch_id = current_id.clone();
-                }
+            }
+            if !current_node.bookmarks.is_empty() && next_branch_id.is_empty() {
+                next_branch_id = current_id.clone();
             }
             for child_id in &current_node.children {
                 queue.push_back((child_id.clone(), distance + 1));
@@ -297,6 +297,8 @@ fn main() -> io::Result<()> {
                     if let Some(first_conflict) = graph.get(&first_conflict_id)
                         && first_conflict_id != working_copy.id
                         && first_conflict_id != prev_conflict_id
+                        && first_conflict_id != next_conflict_id
+                        && first_conflict_id != last_conflict_id
                     {
                         let distance = match first_conflict.distance {
                             0 => "".to_string(),
@@ -307,8 +309,8 @@ fn main() -> io::Result<()> {
                         "".to_string()
                     },
                     if let Some(prev_conflict) = graph.get(&prev_conflict_id)
-                        && prev_conflict_id != working_copy_id
-                        && prev_conflict_id != first_conflict_id
+                    //&& prev_conflict_id != working_copy_id
+                    //&& prev_conflict_id != first_conflict_id
                     {
                         format!(
                             " {RESET}{}⇡{RED}×{MAGENTA}{}",
