@@ -8,6 +8,14 @@ Shows:
 - offset and ID w.r.to @-branch of last immutable (main) and last
 - number of branches, merges and bookmarks
 
+By default, all prompt sections are shown, with `@` first. Use `-s` or `--show` to select sections; repeat it to choose their output order. Include `@` wherever you want the working copy ID to appear. Unique prefixes are accepted, for example `-s m` selects `main`; ambiguous prefixes are rejected.
+
+```sh
+jj-prompt -s conflicts -s branches -s @
+```
+
+Available sections are `@`, `stats`, `conflicts`, `branches`, `main`, `last-change`, and `counts`.
+
 <img src="screenshot.png" alt="jj-prompt screenshot" width="400">
 
 ## Install

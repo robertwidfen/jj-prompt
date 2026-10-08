@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, Write};
 use std::process::{Command, Stdio};
+use std::str::FromStr;
 
 use clap::Parser;
 
@@ -47,6 +48,96 @@ struct Args {
     /// Print the jj command and diagnostic information
     #[arg(short, long)]
     test: bool,
+
+    /// Select prompt sections in output order; unique prefixes are accepted
+    #[arg(
+        short,
+        long,
+        action = clap::ArgAction::Append,
+        value_name = "SECTION",
+        help = "Select sections in output order; unique prefixes accepted (@, stats, conflicts, branches, main, last-change, counts)",
+        value_parser = clap::value_parser!(OutputSection)
+    )]
+    show: Vec<OutputSection>,
+}
+
+impl Args {
+    fn sections(&self) -> Vec<OutputSection> {
+        let requested = if self.show.is_empty() {
+            vec![
+                OutputSection::WorkingCopy,
+                OutputSection::Stats,
+                OutputSection::Conflicts,
+                OutputSection::Branches,
+                OutputSection::Main,
+                OutputSection::LastChange,
+                OutputSection::Counts,
+            ]
+        } else {
+            self.show.clone()
+        };
+
+        requested
+            .into_iter()
+            .fold(Vec::new(), |mut sections, section| {
+                if !sections.contains(&section) {
+                    sections.push(section);
+                }
+                sections
+            })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputSection {
+    WorkingCopy,
+    Stats,
+    Conflicts,
+    Branches,
+    Main,
+    LastChange,
+    Counts,
+}
+
+impl FromStr for OutputSection {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let matching: Vec<_> = [
+            ("@", Self::WorkingCopy),
+            ("stats", Self::Stats),
+            ("conflicts", Self::Conflicts),
+            ("branches", Self::Branches),
+            ("main", Self::Main),
+            ("last-change", Self::LastChange),
+            ("counts", Self::Counts),
+        ]
+        .into_iter()
+        .filter(|(name, _)| name.starts_with(value))
+        .collect();
+
+        match matching.as_slice() {
+            [(_, section)] => Ok(*section),
+            [] => Err(format!(
+                "unknown section '{value}'; expected @, stats, conflicts, branches, main, last-change, or counts"
+            )),
+            _ => Err(format!(
+                "ambiguous section prefix '{value}'; use a longer prefix"
+            )),
+        }
+    }
+}
+
+fn append_section(output: &mut String, fragment: &str) {
+    let fragment = fragment.trim();
+    if fragment.is_empty() {
+        return;
+    }
+
+    if !output.is_empty() {
+        output.push(' ');
+    }
+    output.push_str(fragment);
 }
 
 fn main() -> io::Result<()> {
@@ -269,38 +360,30 @@ fn main() -> io::Result<()> {
         let main = graph.get(&main_id).unwrap();
         let working_copy = graph.get(&working_copy_id).unwrap();
 
-        writeln!(
-            &mut std::io::stdout(),
-            "{}{}{}{}{}{}{}{}{}{}{RESET}{}",
-            // @ indicator and ID
-            if working_copy.has_conflict {
-                format!("{RED}@{MAGENTA}{}", working_copy.id)
-            } else if working_copy.is_immutable {
-                format!("{BLUE}@{MAGENTA}{}", working_copy.id)
-            } else {
-                format!("{GREEN}@{MAGENTA}{}", working_copy.id)
-            },
-            // working copy files modified and lines changed indicator
-            if working_copy.files_modified > 0 {
-                format!(
+        let mut output = String::new();
+
+        for section in args.sections() {
+            let fragment = match section {
+                OutputSection::WorkingCopy if working_copy.has_conflict => {
+                    format!(" {RED}@{MAGENTA}{}", working_copy.id)
+                }
+                OutputSection::WorkingCopy if working_copy.is_immutable => {
+                    format!(" {BLUE}@{MAGENTA}{}", working_copy.id)
+                }
+                OutputSection::WorkingCopy => format!("{GREEN}@{MAGENTA}{}", working_copy.id),
+                OutputSection::Stats if working_copy.files_modified > 0 => format!(
                     " {RESET}{}{GREEN}+{}{RED}-{}{RESET}",
                     working_copy.files_modified,
                     working_copy.lines_added,
                     working_copy.lines_removed
-                )
-            } else {
-                // format!("{GREEN}◌{RESET} ")
-                "".to_string()
-            },
-            // conflict indicator
-            if conflict_count > 0 {
-                format!(
+                ),
+                OutputSection::Stats => String::new(),
+                OutputSection::Conflicts if conflict_count > 0 => format!(
                     " {}{}{}{}{}{RESET}",
-                    // maybe use larger x, X or ❌️ than ×?
                     if conflict_count > 3 {
                         format!("{RESET}{}{RED}×", conflict_count)
                     } else {
-                        "".to_string()
+                        String::new()
                     },
                     if let Some(first_conflict) = graph.get(&first_conflict_id)
                         && first_conflict_id != working_copy.id
@@ -309,23 +392,20 @@ fn main() -> io::Result<()> {
                         && first_conflict_id != last_conflict_id
                     {
                         let distance = match first_conflict.distance {
-                            0 => "".to_string(),
+                            0 => String::new(),
                             d => d.to_string(),
                         };
                         format!(" {RESET}{}⤒{RED}×{MAGENTA}{}", distance, first_conflict.id)
                     } else {
-                        "".to_string()
+                        String::new()
                     },
-                    if let Some(prev_conflict) = graph.get(&prev_conflict_id)
-                    //&& prev_conflict_id != working_copy_id
-                    //&& prev_conflict_id != first_conflict_id
-                    {
+                    if let Some(prev_conflict) = graph.get(&prev_conflict_id) {
                         format!(
                             " {RESET}{}⇡{RED}×{MAGENTA}{}",
                             prev_conflict.distance, prev_conflict.id
                         )
                     } else {
-                        "".to_string()
+                        String::new()
                     },
                     if let Some(next_conflict) = graph.get(&next_conflict_id)
                         && next_conflict_id != working_copy.id
@@ -336,98 +416,103 @@ fn main() -> io::Result<()> {
                             next_conflict.distance, next_conflict.id
                         )
                     } else {
-                        "".to_string()
+                        String::new()
                     },
                     if let Some(last_conflict) = graph.get(&last_conflict_id)
                         && last_conflict_id != working_copy_id
                         && last_conflict_id != next_conflict_id
                     {
                         let distance = match last_conflict.distance {
-                            0 => "".to_string(),
+                            0 => String::new(),
                             d => d.to_string(),
                         };
                         format!(" {RESET}{}⤓{RED}×{MAGENTA}{}", distance, last_conflict.id)
                     } else {
-                        "".to_string()
+                        String::new()
                     },
-                )
-            } else {
-                "".to_string()
-            },
-            // current branch indicator
-            if let Some(prev_branch) = graph.get(&prev_branch_id)
-                && prev_branch.id != main.id
-            {
-                format!(
-                    " {RESET}{}{MAGENTA}{}",
-                    if prev_branch.id == working_copy.id {
-                        "→".to_string()
+                ),
+                OutputSection::Conflicts => String::new(),
+                OutputSection::Branches => {
+                    let previous = if let Some(prev_branch) = graph.get(&prev_branch_id)
+                        && prev_branch.id != main.id
+                    {
+                        format!(
+                            " {RESET}{}{MAGENTA}{}",
+                            if prev_branch.id == working_copy.id {
+                                "→".to_string()
+                            } else {
+                                format!("{}⇡", prev_branch.distance)
+                            },
+                            prev_branch.bookmarks[0]
+                        )
                     } else {
-                        format!("{}⇡", prev_branch.distance)
-                    },
-                    prev_branch.bookmarks[0]
-                )
-            } else {
-                "".to_string()
-            },
-            // next branch indicator
-            if let Some(next_branch) = graph.get(&next_branch_id) {
-                format!(
-                    " {RESET}{}{MAGENTA}{}",
-                    if next_branch_id == working_copy.id {
-                        "→".to_string()
+                        String::new()
+                    };
+                    let next = if let Some(next_branch) = graph.get(&next_branch_id) {
+                        format!(
+                            " {RESET}{}{MAGENTA}{}",
+                            if next_branch_id == working_copy.id {
+                                "→".to_string()
+                            } else {
+                                format!("{}⇣", next_branch.distance)
+                            },
+                            next_branch.bookmarks[0]
+                        )
                     } else {
-                        format!("{}⇣", next_branch.distance)
-                    },
-                    next_branch.bookmarks[0]
-                )
-            } else {
-                "".to_string()
-            },
-            // immutable (main) position indicator
-            if main.distance > 0 {
-                format!(
+                        String::new()
+                    };
+                    format!("{previous}{next}")
+                }
+                OutputSection::Main if main.distance > 0 => format!(
                     " {RESET}{}⤒{BLUE}◆{}",
                     main.distance,
                     if !main.bookmarks.is_empty() {
                         format!("{MAGENTA}{}", main.bookmarks[0])
                     } else {
-                        "".to_string()
+                        String::new()
                     }
-                )
-            } else {
-                "".to_string()
-            },
-            // last change indicator
-            if let Some(last_change) = graph.get(&last_change_id) {
-                format!(
-                    " {RESET}{}⤓{RED}{MAGENTA}{}",
-                    last_change.distance, last_change.id
-                )
-            } else {
-                "".to_string()
-            },
-            if changes.len() <= 2 {
-                "".to_string()
-            } else {
-                format!(" {RESET}{}○", changes.len() - 1)
-            },
-            if branch_count > 0 {
-                format!(" {RESET}{}{BLUE}", branch_count)
-            } else {
-                "".to_string()
-            },
-            if merge_count > 0 {
-                format!(" {RESET}{}{BLUE}", merge_count)
-            } else {
-                "".to_string()
-            },
-            if bookmark_count <= 1 {
-                "".to_string()
-            } else {
-                format!(" {RESET}{}{MAGENTA}", bookmark_count)
-            },
-        )?;
+                ),
+                OutputSection::Main => String::new(),
+                OutputSection::LastChange => {
+                    if let Some(last_change) = graph.get(&last_change_id) {
+                        format!(
+                            " {RESET}{}⤓{RED}{MAGENTA}{}",
+                            last_change.distance, last_change.id
+                        )
+                    } else {
+                        String::new()
+                    }
+                }
+                OutputSection::Counts => {
+                    let changes_fragment = if changes.len() > 2 {
+                        format!(" {RESET}{}○", changes.len() - 1)
+                    } else {
+                        String::new()
+                    };
+                    let branches_fragment = if branch_count > 0 {
+                        format!(" {RESET}{}{BLUE}", branch_count)
+                    } else {
+                        String::new()
+                    };
+                    let merges_fragment = if merge_count > 0 {
+                        format!(" {RESET}{}{BLUE}", merge_count)
+                    } else {
+                        String::new()
+                    };
+                    let bookmarks_fragment = if bookmark_count > 1 {
+                        format!(" {RESET}{}{MAGENTA}", bookmark_count)
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "{changes_fragment}{branches_fragment}{merges_fragment}{bookmarks_fragment}"
+                    )
+                }
+            };
+            append_section(&mut output, &fragment);
+        }
+
+        writeln!(&mut std::io::stdout(), "{output}{RESET}")?;
     }
 
     if let Some(mut process) = jj_process {
@@ -435,4 +520,100 @@ fn main() -> io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Args, OutputSection, append_section};
+
+    #[test]
+    fn sections_are_joined_with_single_spaces() {
+        let mut output = String::new();
+        append_section(&mut output, "  @id");
+        append_section(&mut output, "");
+        append_section(&mut output, "  stats  ");
+        append_section(&mut output, " conflicts");
+
+        assert_eq!(output, "@id stats conflicts");
+    }
+
+    #[test]
+    fn no_section_selection_shows_everything() {
+        let args = Args::try_parse_from(["jj-prompt"]).unwrap();
+
+        assert_eq!(
+            args.sections(),
+            vec![
+                OutputSection::WorkingCopy,
+                OutputSection::Stats,
+                OutputSection::Conflicts,
+                OutputSection::Branches,
+                OutputSection::Main,
+                OutputSection::LastChange,
+                OutputSection::Counts,
+            ]
+        );
+    }
+
+    #[test]
+    fn repeated_section_arguments_select_only_those_sections() {
+        let args = Args::try_parse_from([
+            "jj-prompt",
+            "--show",
+            "conflicts",
+            "-s",
+            "last-change",
+            "-s",
+            "@",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.sections(),
+            vec![
+                OutputSection::Conflicts,
+                OutputSection::LastChange,
+                OutputSection::WorkingCopy
+            ]
+        );
+    }
+
+    #[test]
+    fn section_selection_preserves_order_and_ignores_duplicates() {
+        let args = Args::try_parse_from([
+            "jj-prompt",
+            "--show",
+            "branches",
+            "--show",
+            "stats",
+            "--show",
+            "branches",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.sections(),
+            vec![OutputSection::Branches, OutputSection::Stats]
+        );
+    }
+
+    #[test]
+    fn unique_section_prefix_is_accepted() {
+        let args = Args::try_parse_from(["jj-prompt", "-s", "m"]).unwrap();
+
+        assert_eq!(args.sections(), vec![OutputSection::Main]);
+    }
+
+    #[test]
+    fn ambiguous_section_prefix_is_rejected() {
+        let result = Args::try_parse_from(["jj-prompt", "-s", "c"]);
+
+        let error = match result {
+            Ok(_) => panic!("ambiguous prefixes should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("ambiguous section prefix"));
+    }
 }
