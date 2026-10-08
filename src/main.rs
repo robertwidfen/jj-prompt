@@ -1,7 +1,8 @@
 use std::collections::{HashMap, VecDeque};
-use std::env;
 use std::io::{self, BufRead, Write};
 use std::process::{Command, Stdio};
+
+use clap::Parser;
 
 const RED: &str = "\x1b[31m";
 const GREEN: &str = "\x1b[32m";
@@ -40,11 +41,16 @@ pub struct Change {
     pub distance: usize,
 }
 
-fn main() -> io::Result<()> {
-    let mut args: Vec<String> = env::args().skip(1).collect();
+#[derive(Parser)]
+#[command(version, about)]
+struct Args {
+    /// Print the jj command and diagnostic information
+    #[arg(short, long)]
+    test: bool,
+}
 
-    let test = args.iter().any(|arg| arg == "-t");
-    args.retain(|arg| arg != "-t");
+fn main() -> io::Result<()> {
+    let args = Args::parse();
 
     let mut cmd = Command::new("jj");
     cmd.arg("log")
@@ -66,9 +72,11 @@ fn main() -> io::Result<()> {
                 bookmarks.join(",") ++ "\n""#,
             )
             .stdout(Stdio::piped());
-    if test {
+
+    if args.test {
         println!("Running jj log with command: {:?}", cmd);
     }
+
     let mut process = cmd.spawn()?;
     let process_stdout = process
         .stdout
@@ -239,7 +247,7 @@ fn main() -> io::Result<()> {
         }
     }
 
-    if test {
+    if args.test {
         println!("change_count: {}", changes.len());
         println!("conflict_count: {}", conflict_count);
         println!("main_id: {}", main_id);
