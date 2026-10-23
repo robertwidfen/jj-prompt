@@ -7,16 +7,20 @@ Shows:
 - offset and ID of conflicts: first (to @), previous/next to @ and last
 - offset and ID w.r.to @-branch of last immutable (main) and last
 - number of branches, merges and bookmarks
+- optionally the file with the most changed lines and the names of the changed files
 
 <img src="screenshot.png" alt="jj-prompt screenshot" width="600">
 
-By default, all prompt sections are shown, with `@` first. Use `-s` or `--show` to select sections; repeat it to choose their output order. Include `@` wherever you want the working copy ID to appear. Unique prefixes are accepted, for example `-s m` selects `main`; ambiguous prefixes are rejected.
+By default, all prompt sections except `top-file` and `files` are shown, with `@` first. Use `-s` or `--show` to select sections; repeat it to choose their output order. Include `@` wherever you want the working copy ID to appear. Unique prefixes are accepted, for example `-s m` selects `main`; ambiguous prefixes are rejected.
 
 ```sh
 jj-prompt -s conflicts -s branches -s @
 ```
 
-Available sections are `@`, `stats`, `conflicts`, `branches`, `main`, `last-change`, and `counts`.
+Available sections are `@`, `stats`, `conflicts`, `branches`, `main`, `last-change`, `counts`, `top-file`, and `files`.
+
+- `top-file` shows the file of `@` with the most changed lines, e.g. `main.rs+35-2`.
+- `files` shows the names of the changed files of `@`, at most three, e.g. `main.rs README.md`; more are shown as a count like `+2`.
 
 ## Options
 
@@ -28,7 +32,7 @@ Available sections are `@`, `stats`, `conflicts`, `branches`, `main`, `last-chan
 
 - Outside of a jj repo, or when `jj` fails otherwise, nothing is printed and the exit status is 1. jj errors are only shown with `--test`.
 - `jj` is run with `--ignore-working-copy`, so the prompt never snapshots the working copy. This keeps the prompt fast and avoids jj doing work you did not ask for. As a consequence the stats of `@` show the state as of the last `jj` command you ran, not edits made since.
-- Computing the stats of `@` reads and diffs every changed file, which dominates the run time for large changes. If you do not select the `stats` section with `-s`, they are not computed.
+- Computing the stats of `@` reads and diffs every changed file, which dominates the run time for large changes. If you select none of the `stats`, `top-file` and `files` sections, they are not computed.
 
 ## Install
 

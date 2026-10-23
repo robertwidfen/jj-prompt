@@ -37,9 +37,25 @@ pub struct Change {
     pub files_modified: usize,
     pub lines_added: usize,
     pub lines_removed: usize,
+    /// per file stats, only for the working copy
+    pub files: Vec<FileStat>,
     pub bookmarks: Vec<String>,
     pub children: Vec<String>,
     pub distance: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct FileStat {
+    pub path: String,
+    pub added: usize,
+    pub removed: usize,
+}
+
+impl FileStat {
+    /// The file name without its directories, which is short enough for a prompt.
+    fn name(&self) -> &str {
+        self.path.rsplit('/').next().unwrap_or(&self.path)
+    }
 }
 
 #[derive(Parser)]
@@ -55,7 +71,7 @@ struct Args {
         long,
         action = clap::ArgAction::Append,
         value_name = "SECTION",
-        help = "Select sections in output order; unique prefixes accepted (@, stats, conflicts, branches, main, last-change, counts)",
+        help = "Select sections in output order; unique prefixes accepted (@, stats, conflicts, branches, main, last-change, counts, top-file, files)",
         value_parser = clap::value_parser!(OutputSection)
     )]
     show: Vec<OutputSection>,
@@ -148,6 +164,8 @@ enum OutputSection {
     Main,
     LastChange,
     Counts,
+    TopFile,
+    Files,
 }
 
 impl FromStr for OutputSection {
@@ -162,6 +180,8 @@ impl FromStr for OutputSection {
             ("main", Self::Main),
             ("last-change", Self::LastChange),
             ("counts", Self::Counts),
+            ("top-file", Self::TopFile),
+            ("files", Self::Files),
         ]
         .into_iter()
         .filter(|(name, _)| name.starts_with(value))
@@ -170,7 +190,7 @@ impl FromStr for OutputSection {
         match matching.as_slice() {
             [(_, section)] => Ok(*section),
             [] => Err(format!(
-                "unknown section '{value}'; expected @, stats, conflicts, branches, main, last-change, or counts"
+                "unknown section '{value}'; expected @, stats, conflicts, branches, main, last-change, counts, top-file, or files"
             )),
             _ => Err(format!(
                 "ambiguous section prefix '{value}'; use a longer prefix"
@@ -228,19 +248,21 @@ fn append_section(output: &mut String, fragment: &str) {
 // not run it themselves. As a consequence the stats of @ reflect the last
 // snapshot, i.e. the state as of the last jj command the user ran.
 //
-// {stats} is replaced by JJ_STATS_TEMPLATE or an empty string, see jj_log_template().
-const JJ_LOG_TEMPLATE: &str = r#"change_id.shortest() ++ " " ++
-    parents.map(|p| p.change_id().shortest()).join(",") ++ " " ++
-    if(self.current_working_copy(), "@", "-") ++ " " ++
-    if(self.immutable(), "i", "-") ++ " " ++
-    if(self.conflict(), "x", "-") ++ " " ++
-    {stats} ++ " " ++
+// Fields are separated by \x1f and file stats by \x1e, as paths may contain
+// spaces or commas. {stats} is replaced by JJ_STATS_TEMPLATE or an empty
+// string, see jj_log_template().
+const JJ_LOG_TEMPLATE: &str = r#"change_id.shortest() ++ "\x1f" ++
+    parents.map(|p| p.change_id().shortest()).join(",") ++ "\x1f" ++
+    if(self.current_working_copy(), "@", "-") ++ "\x1f" ++
+    if(self.immutable(), "i", "-") ++ "\x1f" ++
+    if(self.conflict(), "x", "-") ++ "\x1f" ++
+    {stats} ++ "\x1f" ++
     bookmarks.join(",") ++ "\n""#;
 
-// The diff stat of @ is emitted per file as "added:removed,..." so the
+// The diff stat of @ is emitted per file as "added:removed:path" so the
 // (expensive) stat is computed only once; templates cannot bind values.
 const JJ_STATS_TEMPLATE: &str = r#"if(self.current_working_copy(),
-      self.diff().stat().files().map(|f| f.lines_added() ++ ":" ++ f.lines_removed()).join(","),
+      self.diff().stat().files().map(|f| f.lines_added() ++ ":" ++ f.lines_removed() ++ ":" ++ f.path()).join("\x1e"),
       "")"#;
 
 /// The template for `jj log`. The diff stat of @ dominates the run time for
@@ -266,7 +288,7 @@ fn split_list(value: &str) -> Vec<String> {
 /// Parse one line of `jj log` output produced by [`jj_log_template`]:
 /// id parents workingcopy immutable conflict file_stats bookmarks
 fn parse_line(line: &str) -> Option<Change> {
-    let items: Vec<&str> = line.split(' ').collect();
+    let items: Vec<&str> = line.split('\x1f').collect();
     let [
         id,
         parents,
@@ -280,15 +302,21 @@ fn parse_line(line: &str) -> Option<Change> {
         return None;
     };
 
-    let mut files_modified = 0;
-    let mut lines_added = 0;
-    let mut lines_removed = 0;
-    for file_stat in file_stats.split(',').filter(|s| !s.is_empty()) {
-        let (added, removed) = file_stat.split_once(':').unwrap_or((file_stat, ""));
-        files_modified += 1;
-        lines_added += added.parse().unwrap_or(0);
-        lines_removed += removed.parse().unwrap_or(0);
-    }
+    let files: Vec<FileStat> = file_stats
+        .split('\x1e')
+        .filter(|s| !s.is_empty())
+        .map(|file_stat| {
+            // the path comes last as it may contain ':'
+            let mut parts = file_stat.splitn(3, ':');
+            let mut number = || parts.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+            let (added, removed) = (number(), number());
+            FileStat {
+                path: parts.next().unwrap_or_default().to_string(),
+                added,
+                removed,
+            }
+        })
+        .collect();
 
     Some(Change {
         id: id.to_string(),
@@ -296,9 +324,10 @@ fn parse_line(line: &str) -> Option<Change> {
         is_working_copy: working_copy == "@",
         is_immutable: immutable == "i",
         has_conflict: conflict == "x",
-        files_modified,
-        lines_added,
-        lines_removed,
+        files_modified: files.len(),
+        lines_added: files.iter().map(|f| f.added).sum(),
+        lines_removed: files.iter().map(|f| f.removed).sum(),
+        files,
         bookmarks: split_list(bookmarks),
         children: Vec::new(),
         distance: 0,
@@ -563,6 +592,36 @@ fn render(sections: &[OutputSection], graph: &Graph, state: &State) -> Option<St
                 }
                 counts
             }
+            // the file with the most changed lines, the first one on ties
+            OutputSection::TopFile => {
+                match working_copy
+                    .files
+                    .iter()
+                    .rev()
+                    .max_by_key(|f| f.added + f.removed)
+                {
+                    Some(file) => format!(
+                        "{RESET}{}{GREEN}+{}{RED}-{}{RESET}",
+                        file.name(),
+                        file.added,
+                        file.removed
+                    ),
+                    None => String::new(),
+                }
+            }
+            OutputSection::Files => {
+                const MAX_FILES: usize = 3;
+                let names: Vec<&str> = working_copy.files.iter().map(FileStat::name).collect();
+                let mut files = names[..names.len().min(MAX_FILES)].join(" ");
+                if names.len() > MAX_FILES {
+                    files += &format!(" +{}", names.len() - MAX_FILES);
+                }
+                if files.is_empty() {
+                    files
+                } else {
+                    format!("{RESET}{files}")
+                }
+            }
         };
         append_section(&mut output, &fragment);
     }
@@ -620,7 +679,13 @@ fn main() -> io::Result<ExitCode> {
     let args = Args::parse();
 
     let sections = args.sections();
-    let template = jj_log_template(sections.contains(&OutputSection::Stats));
+    let with_stats = sections.iter().any(|section| {
+        matches!(
+            section,
+            OutputSection::Stats | OutputSection::TopFile | OutputSection::Files
+        )
+    });
+    let template = jj_log_template(with_stats);
 
     let mut cmd = Command::new("jj");
     cmd.args(["log", "--ignore-working-copy", "--reversed", "--no-graph"])
@@ -674,13 +739,19 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        Args, Graph, OutputSection, Shell, State, analyze, append_section, jj_log_template,
-        parse_line, render, shell_quote,
+        Args, FileStat, Graph, OutputSection, Shell, State, analyze, append_section,
+        jj_log_template, parse_line, render, shell_quote,
     };
 
-    /// Build and analyze a graph from `jj log` output lines.
+    /// Turn a readable fixture into a `jj log` output line: fields are
+    /// separated by spaces and file stats by ';'.
+    fn line(fixture: &str) -> String {
+        fixture.replace(' ', "\x1f").replace(';', "\x1e")
+    }
+
+    /// Build and analyze a graph from `jj log` output fixtures.
     fn graph(lines: &[&str]) -> (Graph, State) {
-        let mut graph = Graph::new(lines.iter().map(|line| parse_line(line).unwrap()));
+        let mut graph = Graph::new(lines.iter().map(|l| parse_line(&line(l)).unwrap()));
         let state = analyze(&mut graph);
         (graph, state)
     }
@@ -708,7 +779,7 @@ mod tests {
         "zz  - i -  ",
         "ma zz - i -  main",
         "a ma - - x  feat",
-        "b a @ - - 1:0,2:3 ",
+        "b a @ - - 1:0:a.rs;2:3:src/b.rs ",
         "c b - - -  ",
     ];
 
@@ -772,7 +843,7 @@ mod tests {
 
     #[test]
     fn parse_line_reads_fields_and_sums_file_stats() {
-        let change = parse_line("b a,c @ i x 1:0,2:3 main,feat").unwrap();
+        let change = parse_line(&line("b a,c @ i x 1:0:a.rs;2:3:src/b.rs main,feat")).unwrap();
 
         assert_eq!(change.id, "b");
         assert_eq!(change.parents, vec!["a", "c"]);
@@ -789,9 +860,58 @@ mod tests {
     }
 
     #[test]
+    fn parse_line_keeps_paths_with_separators_intact() {
+        let change =
+            parse_line("b\x1f\x1f@\x1f-\x1f-\x1f1:2:dir/my file:v2.txt\x1e3:0:x,y.rs\x1f").unwrap();
+
+        assert_eq!(
+            change.files,
+            [
+                FileStat {
+                    path: "dir/my file:v2.txt".to_string(),
+                    added: 1,
+                    removed: 2
+                },
+                FileStat {
+                    path: "x,y.rs".to_string(),
+                    added: 3,
+                    removed: 0
+                },
+            ]
+        );
+        assert_eq!(change.files[0].name(), "my file:v2.txt");
+    }
+
+    #[test]
+    fn top_file_and_files_sections() {
+        let (graph, state) = graph(LINEAR);
+        let sections = [OutputSection::TopFile, OutputSection::Files];
+
+        let output = render(&sections, &graph, &state).unwrap();
+        assert_eq!(strip_ansi(&output), "b.rs+2-3 a.rs b.rs");
+    }
+
+    #[test]
+    fn top_file_takes_first_on_ties_and_files_are_truncated() {
+        let (graph, state) = graph(&["a  @ - - 1:1:a;2:0:b;0:2:c;1:0:d;0:1:e "]);
+        let sections = [OutputSection::TopFile, OutputSection::Files];
+
+        let output = render(&sections, &graph, &state).unwrap();
+        assert_eq!(strip_ansi(&output), "a+1-1 a b c +2");
+    }
+
+    #[test]
+    fn top_file_and_files_are_empty_without_changes() {
+        let (graph, state) = graph(&["a  @ - -  "]);
+        let sections = [OutputSection::TopFile, OutputSection::Files];
+
+        assert_eq!(render(&sections, &graph, &state).unwrap(), "");
+    }
+
+    #[test]
     fn parse_line_rejects_malformed_lines() {
         assert!(parse_line("").is_none());
-        assert!(parse_line("b a @ - -").is_none());
+        assert!(parse_line(&line("b a @ - -")).is_none());
         assert!(parse_line("Error: something went wrong").is_none());
     }
 
