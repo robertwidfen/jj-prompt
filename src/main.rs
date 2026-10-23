@@ -506,7 +506,6 @@ fn render_conflicts(graph: &Graph, state: &State, working_copy: &Change) -> Stri
     }
     if let Some(next) = graph.get(&state.next_conflict_id)
         && next.id != working_copy.id
-        && !is(&state.last_conflict_id, next)
     {
         conflicts += &format!(" {RESET}{}⇣{RED}×{MAGENTA}{}", next.distance, next.id);
     }
@@ -682,6 +681,24 @@ mod tests {
 
         assert_eq!(state.conflict_count, 1);
         assert_eq!(render(&sections, &graph, &state).unwrap(), "");
+    }
+
+    #[test]
+    fn single_descendant_conflict_is_shown_as_next() {
+        let (graph, state) = graph(&["r  - i -  ", "a r @ - -  ", "b a - - x  "]);
+        let sections = [OutputSection::Conflicts];
+
+        let output = render(&sections, &graph, &state).unwrap();
+        assert_eq!(strip_ansi(&output), "1⇣×b");
+    }
+
+    #[test]
+    fn descendant_conflicts_are_shown_as_next_and_last() {
+        let (graph, state) = graph(&["r  - i -  ", "a r @ - -  ", "b a - - x  ", "c b - - x  "]);
+        let sections = [OutputSection::Conflicts];
+
+        let output = render(&sections, &graph, &state).unwrap();
+        assert_eq!(strip_ansi(&output), "1⇣×b 2⤓×c");
     }
 
     #[test]
