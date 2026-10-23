@@ -228,17 +228,32 @@ fn append_section(output: &mut String, fragment: &str) {
 // not run it themselves. As a consequence the stats of @ reflect the last
 // snapshot, i.e. the state as of the last jj command the user ran.
 //
-// The diff stat of @ is emitted per file as "added:removed,..." so the
-// (expensive) stat is computed only once; templates cannot bind values.
+// {stats} is replaced by JJ_STATS_TEMPLATE or an empty string, see jj_log_template().
 const JJ_LOG_TEMPLATE: &str = r#"change_id.shortest() ++ " " ++
     parents.map(|p| p.change_id().shortest()).join(",") ++ " " ++
     if(self.current_working_copy(), "@", "-") ++ " " ++
     if(self.immutable(), "i", "-") ++ " " ++
     if(self.conflict(), "x", "-") ++ " " ++
-    if(self.current_working_copy(),
-      self.diff().stat().files().map(|f| f.lines_added() ++ ":" ++ f.lines_removed()).join(","),
-      "") ++ " " ++
+    {stats} ++ " " ++
     bookmarks.join(",") ++ "\n""#;
+
+// The diff stat of @ is emitted per file as "added:removed,..." so the
+// (expensive) stat is computed only once; templates cannot bind values.
+const JJ_STATS_TEMPLATE: &str = r#"if(self.current_working_copy(),
+      self.diff().stat().files().map(|f| f.lines_added() ++ ":" ++ f.lines_removed()).join(","),
+      "")"#;
+
+/// The template for `jj log`. The diff stat of @ dominates the run time for
+/// large changes (it reads and diffs every changed file), so it is only
+/// included when it is shown.
+fn jj_log_template(with_stats: bool) -> String {
+    let stats = if with_stats {
+        JJ_STATS_TEMPLATE
+    } else {
+        r#""""#
+    };
+    JJ_LOG_TEMPLATE.replace("{stats}", stats)
+}
 
 fn split_list(value: &str) -> Vec<String> {
     value
@@ -248,7 +263,7 @@ fn split_list(value: &str) -> Vec<String> {
         .collect()
 }
 
-/// Parse one line of `jj log` output produced by [`JJ_LOG_TEMPLATE`]:
+/// Parse one line of `jj log` output produced by [`jj_log_template`]:
 /// id parents workingcopy immutable conflict file_stats bookmarks
 fn parse_line(line: &str) -> Option<Change> {
     let items: Vec<&str> = line.split(' ').collect();
@@ -604,9 +619,12 @@ fn render_conflicts(graph: &Graph, state: &State, working_copy: &Change) -> Stri
 fn main() -> io::Result<ExitCode> {
     let args = Args::parse();
 
+    let sections = args.sections();
+    let template = jj_log_template(sections.contains(&OutputSection::Stats));
+
     let mut cmd = Command::new("jj");
     cmd.args(["log", "--ignore-working-copy", "--reversed", "--no-graph"])
-        .args(["--color", "never", "-T", JJ_LOG_TEMPLATE])
+        .args(["--color", "never", "-T", &template])
         .stdout(Stdio::piped());
 
     // a prompt must not print jj errors, e.g. when not inside a jj repo
@@ -640,7 +658,7 @@ fn main() -> io::Result<ExitCode> {
         println!("{state:#?}");
     }
 
-    if let Some(output) = render(&args.sections(), &graph, &state) {
+    if let Some(output) = render(&sections, &graph, &state) {
         writeln!(
             io::stdout(),
             "{}",
@@ -656,8 +674,8 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        Args, Graph, OutputSection, Shell, State, analyze, append_section, parse_line, render,
-        shell_quote,
+        Args, Graph, OutputSection, Shell, State, analyze, append_section, jj_log_template,
+        parse_line, render, shell_quote,
     };
 
     /// Build and analyze a graph from `jj log` output lines.
@@ -743,6 +761,13 @@ mod tests {
         assert_eq!(shell_quote(r"a\\"), r"'a'\\''\\''");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
         assert_eq!(shell_quote("\"\n\""), "'\"\n\"'");
+    }
+
+    #[test]
+    fn diff_stat_is_only_requested_when_shown() {
+        assert!(jj_log_template(true).contains(".stat()"));
+        assert!(!jj_log_template(false).contains(".stat()"));
+        assert!(!jj_log_template(false).contains("{stats}"));
     }
 
     #[test]
