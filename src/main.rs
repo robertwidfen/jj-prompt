@@ -129,14 +129,13 @@ impl Args {
             self.show.clone()
         };
 
-        requested
-            .into_iter()
-            .fold(Vec::new(), |mut sections, section| {
-                if !sections.contains(&section) {
-                    sections.push(section);
-                }
-                sections
-            })
+        let mut sections = Vec::new();
+        for section in requested {
+            if !sections.contains(&section) {
+                sections.push(section);
+            }
+        }
+        sections
     }
 }
 
@@ -268,6 +267,9 @@ struct Graph {
 }
 
 impl Graph {
+    /// Build the graph from changes in `jj log --reversed` order, i.e. parents
+    /// before their children, so children can be linked while reading and end
+    /// up in log order (which keeps the graph walks deterministic).
     fn new(changes: impl IntoIterator<Item = Change>) -> Self {
         let mut graph = Graph {
             changes: HashMap::new(),
@@ -278,25 +280,13 @@ impl Graph {
             if change.is_working_copy && graph.working_copy_id.is_none() {
                 graph.working_copy_id = Some(change.id.clone());
             }
+            for parent_id in &change.parents {
+                if let Some(parent) = graph.changes.get_mut(parent_id) {
+                    parent.children.push(change.id.clone());
+                }
+            }
             graph.order.push(change.id.clone());
             graph.changes.insert(change.id.clone(), change);
-        }
-
-        // add children to their respective parents
-        let edges: Vec<(String, String)> = graph
-            .changes
-            .values()
-            .flat_map(|child| {
-                child
-                    .parents
-                    .iter()
-                    .map(|parent_id| (parent_id.clone(), child.id.clone()))
-            })
-            .collect();
-        for (parent_id, child_id) in edges {
-            if let Some(parent) = graph.changes.get_mut(&parent_id) {
-                parent.children.push(child_id);
-            }
         }
         graph
     }
@@ -762,6 +752,22 @@ mod tests {
         );
         assert_eq!(state.main_id.as_deref(), Some("r"));
         assert_eq!((state.branch_count, state.merge_count), (2, 1));
+    }
+
+    #[test]
+    fn children_are_linked_in_log_order() {
+        let (graph, state) = graph(&[
+            "r  - i -  ",
+            "a r @ - -  ",
+            "b a - - -  ",
+            "c a - - -  ",
+            "d a - - -  ",
+            "e a - - -  ",
+            "f a - - -  ",
+        ]);
+
+        assert_eq!(graph.changes["a"].children, ["b", "c", "d", "e", "f"]);
+        assert_eq!(state.last_change_id.as_deref(), Some("f"));
     }
 
     #[test]
