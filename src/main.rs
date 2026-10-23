@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::process::{Command, ExitCode, Stdio};
 use std::str::FromStr;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 const RED: &str = "\x1b[31m";
 const GREEN: &str = "\x1b[32m";
@@ -59,6 +59,58 @@ struct Args {
         value_parser = clap::value_parser!(OutputSection)
     )]
     show: Vec<OutputSection>,
+
+    /// Mark color codes as zero-width for the shell using the prompt directly
+    #[arg(long, value_enum, default_value_t = Shell::Plain)]
+    shell: Shell,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Shell {
+    /// Raw color codes, e.g. for starship which wraps them itself
+    Plain,
+    /// Wrap color codes in readline's \001 and \002 markers
+    Bash,
+    /// Wrap color codes in %{ %} and escape % as %%
+    Zsh,
+    /// Raw color codes, fish needs no wrapping
+    Fish,
+}
+
+impl Shell {
+    /// Make the color codes in `prompt` zero-width for the shell, so it can
+    /// compute the prompt width correctly (otherwise line editing breaks).
+    fn format(self, prompt: &str) -> String {
+        let (start, end) = match self {
+            Shell::Plain | Shell::Fish => return prompt.to_string(),
+            // \[ and \] are decoded before command substitution, so they would
+            // not work with PS1='$(jj-prompt)'; readline's own markers always do
+            Shell::Bash => ("\x01", "\x02"),
+            Shell::Zsh => ("%{", "%}"),
+        };
+
+        let mut result = String::with_capacity(prompt.len() * 2);
+        let mut rest = prompt;
+        while let Some(escape_start) = rest.find('\x1b') {
+            let (text, escape) = rest.split_at(escape_start);
+            let escape_len = escape.find('m').map_or(escape.len(), |m| m + 1);
+            result += &self.escape_text(text);
+            result += start;
+            result += &escape[..escape_len];
+            result += end;
+            rest = &escape[escape_len..];
+        }
+        result += &self.escape_text(rest);
+        result
+    }
+
+    /// Escape characters in plain text the shell would interpret in a prompt.
+    fn escape_text(self, text: &str) -> String {
+        match self {
+            Shell::Zsh => text.replace('%', "%%"),
+            _ => text.to_string(),
+        }
+    }
 }
 
 impl Args {
@@ -567,7 +619,11 @@ fn main() -> io::Result<ExitCode> {
     }
 
     if let Some(output) = render(&args.sections(), &graph, &state) {
-        writeln!(io::stdout(), "{output}{RESET}")?;
+        writeln!(
+            io::stdout(),
+            "{}",
+            args.shell.format(&format!("{output}{RESET}"))
+        )?;
     }
 
     Ok(ExitCode::SUCCESS)
@@ -577,7 +633,9 @@ fn main() -> io::Result<ExitCode> {
 mod tests {
     use clap::Parser;
 
-    use super::{Args, Graph, OutputSection, State, analyze, append_section, parse_line, render};
+    use super::{
+        Args, Graph, OutputSection, Shell, State, analyze, append_section, parse_line, render,
+    };
 
     /// Build and analyze a graph from `jj log` output lines.
     fn graph(lines: &[&str]) -> (Graph, State) {
@@ -612,6 +670,38 @@ mod tests {
         "b a @ - - 1:0,2:3 ",
         "c b - - -  ",
     ];
+
+    const COLORED: &str = "\x1b[32m@\x1b[35mab 50%\x1b[0m";
+
+    #[test]
+    fn plain_and_fish_output_is_unchanged() {
+        assert_eq!(Shell::Plain.format(COLORED), COLORED);
+        assert_eq!(Shell::Fish.format(COLORED), COLORED);
+    }
+
+    #[test]
+    fn bash_wraps_color_codes_in_readline_markers() {
+        assert_eq!(
+            Shell::Bash.format(COLORED),
+            "\x01\x1b[32m\x02@\x01\x1b[35m\x02ab 50%\x01\x1b[0m\x02"
+        );
+    }
+
+    #[test]
+    fn zsh_wraps_color_codes_and_escapes_percent() {
+        assert_eq!(
+            Shell::Zsh.format(COLORED),
+            "%{\x1b[32m%}@%{\x1b[35m%}ab 50%%%{\x1b[0m%}"
+        );
+    }
+
+    #[test]
+    fn shell_defaults_to_plain() {
+        let args = Args::try_parse_from(["jj-prompt"]).unwrap();
+        assert_eq!(args.shell, Shell::Plain);
+        let args = Args::try_parse_from(["jj-prompt", "--shell", "zsh"]).unwrap();
+        assert_eq!(args.shell, Shell::Zsh);
+    }
 
     #[test]
     fn parse_line_reads_fields_and_sums_file_stats() {

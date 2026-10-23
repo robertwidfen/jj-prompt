@@ -31,3 +31,24 @@ format = "$output "
 shell = "jj-prompt"
 ignore_timeout = true
 ```
+
+Or use it directly in your shell prompt. Pass `--shell` so the shell knows the
+color codes take no space, otherwise line editing breaks for long commands.
+Starship and fish handle this themselves.
+
+```sh
+# bash
+PS1='$(jj-prompt --shell bash) \$ '
+
+# zsh
+setopt prompt_subst
+PROMPT='$(jj-prompt --shell zsh) %# '
+```
+
+```fish
+# fish
+function fish_prompt
+    jj-prompt --shell fish | string collect
+    echo -n ' > '
+end
+```
