@@ -179,6 +179,38 @@ impl FromStr for OutputSection {
     }
 }
 
+/// Quote `arg` so bash, zsh and fish all read it back unchanged.
+fn shell_quote(arg: &str) -> String {
+    let is_safe = |c: char| c.is_ascii_alphanumeric() || "-_./:=@,+%".contains(c);
+    if !arg.is_empty() && arg.chars().all(is_safe) {
+        arg.to_string()
+    } else {
+        // inside single quotes nothing is special except ' itself; fish also
+        // treats \\ and \' as escapes, so a backslash followed by \, ' or the
+        // closing quote is put outside the quotes escaped
+        let mut quoted = String::from("'");
+        let mut chars = arg.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\'' => quoted += "'\\''",
+                '\\' if matches!(chars.peek(), None | Some('\\' | '\'')) => quoted += "'\\\\'",
+                c => quoted.push(c),
+            }
+        }
+        quoted.push('\'');
+        quoted
+    }
+}
+
+/// The command as a line that can be copied and run in a shell.
+fn command_line(cmd: &Command) -> String {
+    std::iter::once(cmd.get_program())
+        .chain(cmd.get_args())
+        .map(|arg| shell_quote(&arg.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn append_section(output: &mut String, fragment: &str) {
     let fragment = fragment.trim();
     if fragment.is_empty() {
@@ -583,7 +615,7 @@ fn main() -> io::Result<ExitCode> {
     }
 
     if args.test {
-        println!("Running jj log with command: {:?}", cmd);
+        println!("Running: {}", command_line(&cmd));
     }
 
     let jj_output = cmd.output()?;
@@ -625,6 +657,7 @@ mod tests {
 
     use super::{
         Args, Graph, OutputSection, Shell, State, analyze, append_section, parse_line, render,
+        shell_quote,
     };
 
     /// Build and analyze a graph from `jj log` output lines.
@@ -691,6 +724,25 @@ mod tests {
         assert_eq!(args.shell, Shell::Plain);
         let args = Args::try_parse_from(["jj-prompt", "--shell", "zsh"]).unwrap();
         assert_eq!(args.shell, Shell::Zsh);
+    }
+
+    #[test]
+    fn shell_quote_leaves_simple_arguments_alone() {
+        assert_eq!(
+            shell_quote("--ignore-working-copy"),
+            "--ignore-working-copy"
+        );
+        assert_eq!(shell_quote("jj"), "jj");
+    }
+
+    #[test]
+    fn shell_quote_quotes_special_characters() {
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("a b\nc"), "'a b\nc'");
+        assert_eq!(shell_quote(r"a\nb"), r"'a\nb'");
+        assert_eq!(shell_quote(r"a\\"), r"'a'\\''\\''");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        assert_eq!(shell_quote("\"\n\""), "'\"\n\"'");
     }
 
     #[test]
