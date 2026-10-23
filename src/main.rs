@@ -1,6 +1,6 @@
-use std::collections::{HashMap, VecDeque};
-use std::io::{self, BufRead, Write};
-use std::process::{Command, Stdio};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{self, Write};
+use std::process::{Command, ExitCode, Stdio};
 use std::str::FromStr;
 
 use clap::Parser;
@@ -140,41 +140,50 @@ fn append_section(output: &mut String, fragment: &str) {
     output.push_str(fragment);
 }
 
-fn main() -> io::Result<()> {
+fn main() -> io::Result<ExitCode> {
     let args = Args::parse();
 
     let mut cmd = Command::new("jj");
+    // --ignore-working-copy: do not snapshot the working copy. Snapshotting would
+    // make the prompt slower and users do not expect jj to snapshot when they did
+    // not run it themselves. As a consequence the stats of @ reflect the last
+    // snapshot, i.e. the state as of the last jj command the user ran.
     cmd.arg("log")
-            .arg("--ignore-working-copy")
-            .arg("--reversed")
-            .arg("--no-graph")
-            .arg("--color")
-            .arg("never")
-            .arg("-T")
-            .arg(
-                r#"change_id.shortest() ++ " " ++
-                parents.map(|p| p.change_id().shortest()).join(",") ++ " " ++
-                if(self.current_working_copy(), "@", "-") ++ " " ++
-                if(self.immutable(), "i", "-") ++ " " ++ 
-                if(self.conflict(), "x", "-") ++ " " ++ 
-                if(self.current_working_copy(), 
-                  self.diff().files().len() ++ " " ++ self.diff().stat().total_added() ++ " " ++ self.diff().stat().total_removed(), 
-                  "0 0 0") ++ " " ++ 
-                bookmarks.join(",") ++ "\n""#,
-            )
-            .stdout(Stdio::piped());
+        .arg("--ignore-working-copy")
+        .arg("--reversed")
+        .arg("--no-graph")
+        .arg("--color")
+        .arg("never")
+        .arg("-T")
+        // The diff stat of @ is emitted per file as "added:removed,..." so the
+        // (expensive) stat is computed only once; templates cannot bind values.
+        .arg(
+            r#"change_id.shortest() ++ " " ++
+            parents.map(|p| p.change_id().shortest()).join(",") ++ " " ++
+            if(self.current_working_copy(), "@", "-") ++ " " ++
+            if(self.immutable(), "i", "-") ++ " " ++
+            if(self.conflict(), "x", "-") ++ " " ++
+            if(self.current_working_copy(),
+              self.diff().stat().files().map(|f| f.lines_added() ++ ":" ++ f.lines_removed()).join(","),
+              "") ++ " " ++
+            bookmarks.join(",") ++ "\n""#,
+        )
+        .stdout(Stdio::piped());
+
+    // a prompt must not print jj errors, e.g. when not inside a jj repo
+    if !args.test {
+        cmd.stderr(Stdio::null());
+    }
 
     if args.test {
         println!("Running jj log with command: {:?}", cmd);
     }
 
-    let mut process = cmd.spawn()?;
-    let process_stdout = process
-        .stdout
-        .take()
-        .expect("jj log stdout should be piped");
-    let jj_process = Some(process);
-    let input: Box<dyn BufRead> = { Box::new(io::BufReader::new(process_stdout)) };
+    let jj_output = cmd.output()?;
+    if !jj_output.status.success() {
+        return Ok(ExitCode::FAILURE);
+    }
+    let input = String::from_utf8_lossy(&jj_output.stdout);
 
     // build a graph of changes based on parents
     type Id = String;
@@ -186,23 +195,43 @@ fn main() -> io::Result<()> {
     let mut conflict_count = 0;
     let mut bookmark_count = 0;
 
-    for line in input.lines().map_while(Result::ok) {
-        // id parents workingcopy immutabled conflict files_modified lines_added lines_removed branches
-        let items: Vec<&str> = line.split(" ").collect();
+    for line in input.lines() {
+        // id parents workingcopy immutable conflict file_stats bookmarks
+        let items: Vec<&str> = line.split(' ').collect();
+        let [
+            id,
+            parents,
+            working_copy,
+            immutable,
+            conflict,
+            file_stats,
+            bookmarks,
+        ] = items[..]
+        else {
+            if args.test {
+                println!("skipping unexpected line: {line:?}");
+            }
+            continue;
+        };
 
-        let id = items[0];
-        let parents: Vec<String> = items[1]
-            .split(",")
+        let parents: Vec<String> = parents
+            .split(',')
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
             .collect();
-        let is_working_copy = items[2] == "@";
-        let is_immutable = items[3] == "i";
-        let has_conflict = items[4] == "x";
-        let files_modified = items[5].parse().unwrap_or(0);
-        let lines_added = items[6].parse().unwrap_or(0);
-        let lines_removed = items[7].parse().unwrap_or(0);
-        let bookmarks: Vec<String> = items[8]
+        let is_working_copy = working_copy == "@";
+        let is_immutable = immutable == "i";
+        let has_conflict = conflict == "x";
+        let mut files_modified = 0;
+        let mut lines_added = 0;
+        let mut lines_removed = 0;
+        for file_stat in file_stats.split(',').filter(|s| !s.is_empty()) {
+            let (added, removed) = file_stat.split_once(':').unwrap_or((file_stat, ""));
+            files_modified += 1;
+            lines_added += added.parse().unwrap_or(0);
+            lines_removed += removed.parse().unwrap_or(0);
+        }
+        let bookmarks: Vec<String> = bookmarks
             .split(",")
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
@@ -261,20 +290,22 @@ fn main() -> io::Result<()> {
         }
     }
 
-    // backward graph search and distance calculation starting from the working copy
+    // backward graph search and distance calculation starting from the working copy;
+    // being a BFS the first visit of a change is via a shortest path, so each change
+    // is visited only once (otherwise merges would cause exponential revisits)
     let mut queue = VecDeque::new();
+    let mut visited = HashSet::new();
 
     let mut first_conflict_id = String::new();
     let mut prev_conflict_id = String::new();
     let mut prev_branch_id = String::new();
     queue.push_back((working_copy_id.clone(), 0));
     while let Some((current_id, distance)) = queue.pop_front() {
+        if !visited.insert(current_id.clone()) {
+            continue;
+        }
         if let Some(current_node) = graph.get_mut(&current_id) {
-            if current_node.distance == 0 {
-                current_node.distance = distance;
-            } else {
-                current_node.distance = distance.min(current_node.distance);
-            }
+            current_node.distance = distance;
             if current_node.is_immutable && main_id.is_empty() {
                 main_id = current_id.clone();
             }
@@ -312,14 +343,14 @@ fn main() -> io::Result<()> {
     let mut last_conflict_id = String::new();
     let mut last_change_id = String::new();
     queue.clear();
+    visited.clear();
     queue.push_back((working_copy_id.clone(), 0));
     while let Some((current_id, distance)) = queue.pop_front() {
+        if !visited.insert(current_id.clone()) {
+            continue;
+        }
         if let Some(current_node) = graph.get_mut(&current_id) {
-            if current_node.distance == 0 {
-                current_node.distance = distance;
-            } else {
-                current_node.distance = distance.min(current_node.distance);
-            }
+            current_node.distance = distance;
             if current_id != working_copy_id {
                 last_change_id = current_id.clone();
                 if current_node.has_conflict {
@@ -356,9 +387,10 @@ fn main() -> io::Result<()> {
     // other symbols ⌃⌄▴▾▲▼ - see https://en.wikipedia.org/wiki/Geometric_Shapes_(Unicode_block)
     // https://en.wikipedia.org/wiki/Arrows_(Unicode_block)
 
-    if !changes.is_empty() {
-        let main = graph.get(&main_id).unwrap();
-        let working_copy = graph.get(&working_copy_id).unwrap();
+    // the working copy may be missing if the log revset does not include it
+    if let Some(working_copy) = graph.get(&working_copy_id) {
+        // main may be missing if no immutable ancestor is in the log revset
+        let main = graph.get(&main_id);
 
         let mut output = String::new();
 
@@ -378,63 +410,71 @@ fn main() -> io::Result<()> {
                     working_copy.lines_removed
                 ),
                 OutputSection::Stats => String::new(),
-                OutputSection::Conflicts if conflict_count > 0 => format!(
-                    " {}{}{}{}{}{RESET}",
-                    if conflict_count > 3 {
-                        format!("{RESET}{}{RED}×", conflict_count)
+                OutputSection::Conflicts if conflict_count > 0 => {
+                    let conflicts = format!(
+                        "{}{}{}{}{}",
+                        if conflict_count > 3 {
+                            format!("{RESET}{}{RED}×", conflict_count)
+                        } else {
+                            String::new()
+                        },
+                        if let Some(first_conflict) = graph.get(&first_conflict_id)
+                            && first_conflict_id != working_copy.id
+                            && first_conflict_id != prev_conflict_id
+                            && first_conflict_id != next_conflict_id
+                            && first_conflict_id != last_conflict_id
+                        {
+                            let distance = match first_conflict.distance {
+                                0 => String::new(),
+                                d => d.to_string(),
+                            };
+                            format!(" {RESET}{}⤒{RED}×{MAGENTA}{}", distance, first_conflict.id)
+                        } else {
+                            String::new()
+                        },
+                        if let Some(prev_conflict) = graph.get(&prev_conflict_id) {
+                            format!(
+                                " {RESET}{}⇡{RED}×{MAGENTA}{}",
+                                prev_conflict.distance, prev_conflict.id
+                            )
+                        } else {
+                            String::new()
+                        },
+                        if let Some(next_conflict) = graph.get(&next_conflict_id)
+                            && next_conflict_id != working_copy.id
+                            && next_conflict_id != last_conflict_id
+                        {
+                            format!(
+                                " {RESET}{}⇣{RED}×{MAGENTA}{}",
+                                next_conflict.distance, next_conflict.id
+                            )
+                        } else {
+                            String::new()
+                        },
+                        if let Some(last_conflict) = graph.get(&last_conflict_id)
+                            && last_conflict_id != working_copy_id
+                            && last_conflict_id != next_conflict_id
+                        {
+                            let distance = match last_conflict.distance {
+                                0 => String::new(),
+                                d => d.to_string(),
+                            };
+                            format!(" {RESET}{}⤓{RED}×{MAGENTA}{}", distance, last_conflict.id)
+                        } else {
+                            String::new()
+                        },
+                    );
+                    // all parts may be empty, e.g. when @ is the only conflict
+                    if conflicts.is_empty() {
+                        conflicts
                     } else {
-                        String::new()
-                    },
-                    if let Some(first_conflict) = graph.get(&first_conflict_id)
-                        && first_conflict_id != working_copy.id
-                        && first_conflict_id != prev_conflict_id
-                        && first_conflict_id != next_conflict_id
-                        && first_conflict_id != last_conflict_id
-                    {
-                        let distance = match first_conflict.distance {
-                            0 => String::new(),
-                            d => d.to_string(),
-                        };
-                        format!(" {RESET}{}⤒{RED}×{MAGENTA}{}", distance, first_conflict.id)
-                    } else {
-                        String::new()
-                    },
-                    if let Some(prev_conflict) = graph.get(&prev_conflict_id) {
-                        format!(
-                            " {RESET}{}⇡{RED}×{MAGENTA}{}",
-                            prev_conflict.distance, prev_conflict.id
-                        )
-                    } else {
-                        String::new()
-                    },
-                    if let Some(next_conflict) = graph.get(&next_conflict_id)
-                        && next_conflict_id != working_copy.id
-                        && next_conflict_id != last_conflict_id
-                    {
-                        format!(
-                            " {RESET}{}⇣{RED}×{MAGENTA}{}",
-                            next_conflict.distance, next_conflict.id
-                        )
-                    } else {
-                        String::new()
-                    },
-                    if let Some(last_conflict) = graph.get(&last_conflict_id)
-                        && last_conflict_id != working_copy_id
-                        && last_conflict_id != next_conflict_id
-                    {
-                        let distance = match last_conflict.distance {
-                            0 => String::new(),
-                            d => d.to_string(),
-                        };
-                        format!(" {RESET}{}⤓{RED}×{MAGENTA}{}", distance, last_conflict.id)
-                    } else {
-                        String::new()
-                    },
-                ),
+                        format!("{conflicts}{RESET}")
+                    }
+                }
                 OutputSection::Conflicts => String::new(),
                 OutputSection::Branches => {
                     let previous = if let Some(prev_branch) = graph.get(&prev_branch_id)
-                        && prev_branch.id != main.id
+                        && main.is_none_or(|main| prev_branch.id != main.id)
                     {
                         format!(
                             " {RESET}{}{MAGENTA}{}",
@@ -463,15 +503,20 @@ fn main() -> io::Result<()> {
                     };
                     format!("{previous}{next}")
                 }
-                OutputSection::Main if main.distance > 0 => format!(
-                    " {RESET}{}⤒{BLUE}◆{}",
-                    main.distance,
-                    if !main.bookmarks.is_empty() {
-                        format!("{MAGENTA}{}", main.bookmarks[0])
-                    } else {
-                        String::new()
-                    }
-                ),
+                OutputSection::Main
+                    if let Some(main) = main
+                        && main.distance > 0 =>
+                {
+                    format!(
+                        " {RESET}{}⤒{BLUE}◆{}",
+                        main.distance,
+                        if !main.bookmarks.is_empty() {
+                            format!("{MAGENTA}{}", main.bookmarks[0])
+                        } else {
+                            String::new()
+                        }
+                    )
+                }
                 OutputSection::Main => String::new(),
                 OutputSection::LastChange => {
                     if let Some(last_change) = graph.get(&last_change_id) {
@@ -515,11 +560,7 @@ fn main() -> io::Result<()> {
         writeln!(&mut std::io::stdout(), "{output}{RESET}")?;
     }
 
-    if let Some(mut process) = jj_process {
-        process.wait()?;
-    }
-
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(test)]
